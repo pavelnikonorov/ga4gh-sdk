@@ -32,11 +32,8 @@ jobs:
             runner: macos-15-intel
             target: x86_64-apple-darwin
             smoke: true
-          - platform: macOS arm64
-            id: macos-arm64
-            runner: macos-15
-            target: aarch64-apple-darwin
-            smoke: true
+          # Fork-only TestPyPI rehearsal: GitHub cancelled the macOS arm64
+          # runner twice before any step. The upstream PR CI covers this wheel.
           - platform: Windows x86-64
             id: windows-x86_64
             runner: windows-2025
