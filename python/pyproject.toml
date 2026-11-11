@@ -3,14 +3,15 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "ga4gh-sdk"
-description = "Python bindings for GA4GH API service clients"
+name = "ga4gh-sdk-release-rehearsal"
+description = "TestPyPI release rehearsal for GA4GH SDK Python bindings"
 readme = { text = """
-# GA4GH SDK for Python
+# GA4GH SDK for Python (TestPyPI rehearsal)
 
 Python clients for GA4GH TES, WES, DRS, and Service Info APIs.
 
-Install with `pip install ga4gh-sdk` and import classes from `ga4gh_sdk`.
+This is a TestPyPI rehearsal package. Install the production package as
+`ga4gh-sdk` when it is released. Python imports use `ga4gh_sdk`.
 For examples, supported Python APIs, and configuration, see the
 [Python bindings guide](https://github.com/ga4gh/ga4gh-sdk/blob/main/python/README.md).
 """, content-type = "text/markdown" }
