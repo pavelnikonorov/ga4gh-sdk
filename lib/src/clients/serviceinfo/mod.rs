@@ -33,18 +33,44 @@ impl ServiceInfo {
 
     /// Retrieves the service information.
     ///
+    /// Any service type is returned as declared, including custom ones and
+    /// unknown API versions; fields that the schema doesn't define stay in
+    /// `extra`. See the [Service Info contract] for the full behavior.
+    ///
     /// # Returns
     ///
     /// A `Result` containing the service information or an error.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Http`](crate::Error::Http) for a non-2xx status,
+    /// [`Error::Parse`](crate::Error::Parse) for malformed JSON or a document
+    /// that isn't a valid [`models::Service`], for example one without a
+    /// required field, and an error with a [`std::str::Utf8Error`] for a body
+    /// that isn't valid UTF-8, among the other errors of a request, such as a
+    /// [`BodyLimitError`](crate::utils::transport::BodyLimitError) for a body
+    /// over the limit or a timeout. A failed decoding isn't retried.
+    ///
+    /// [Service Info contract]: https://github.com/ga4gh/ga4gh-sdk/blob/main/docs/api_compatibility.md#service-info
     pub async fn get(&self) -> crate::Result<models::Service> {
         self.get_at("service-info").await
     }
 
     /// Retrieves service information from a path relative to the configured API root,
     /// within the `discovery` limit of the configuration's
-    /// [`Timeouts`](crate::utils::timeouts::Timeouts).
+    /// [`Timeouts`](crate::utils::timeouts::Timeouts). It decodes and fails as
+    /// [`Self::get`] does.
     pub async fn get_at(&self, endpoint: &str) -> crate::Result<models::Service> {
         fetch(&self.transport, endpoint).await
+    }
+
+    /// Retrieves the response body of `service-info` as received, within the
+    /// same `discovery` limit as [`get`](Self::get), without parsing it.
+    ///
+    /// Callers that print or store the service info use it to keep the
+    /// server's JSON text, such as the spelling of large numbers.
+    pub async fn get_raw(&self) -> crate::Result<String> {
+        fetch_raw(&self.transport, "service-info").await
     }
 }
 
@@ -52,7 +78,7 @@ impl ServiceInfo {
 /// transport's configuration, which replaces its request timeout.
 pub(crate) async fn fetch_raw(transport: &Transport, endpoint: &str) -> crate::Result<String> {
     transport
-        .get_within(endpoint, transport.config.timeouts.discovery)
+        .get_within(endpoint, transport.configuration().timeouts.discovery)
         .await
 }
 
@@ -211,6 +237,31 @@ mod tests {
 
         // Assert
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_raw_returns_the_body_as_received() {
+        let body = r#"{"id":"i","big":123456789012345678901234567890,"f":1.00}"#;
+        let _m = mock("GET", "/raw/v1/service-info")
+            .with_status(200)
+            .with_body(body)
+            .create();
+        let base = Url::parse(&format!("{}/raw/v1/", mockito::server_url())).unwrap();
+        let client = ServiceInfo::new(&Configuration::new(base)).unwrap();
+        assert_eq!(client.get_raw().await.unwrap(), body);
+
+        let _error = mock("GET", "/raw-error/service-info")
+            .with_status(503)
+            .create();
+        let base = Url::parse(&format!("{}/raw-error", mockito::server_url())).unwrap();
+        let client = ServiceInfo::new(&Configuration::new(base)).unwrap();
+        let error = client.get_raw().await.unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::utils::transport::HttpError>()
+                .map(|http| http.status.as_u16()),
+            Some(503)
+        );
     }
 
     #[tokio::test]

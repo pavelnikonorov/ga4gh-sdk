@@ -29,20 +29,23 @@ fn config(root: &str) -> Configuration {
     Configuration::new(Url::parse(&api_root(root)).unwrap())
 }
 
+/// The body of a TES service-info response.
+fn service_info_body() -> String {
+    json!({
+        "id": "org.example.tes",
+        "name": "Example TES",
+        "type": {"group": "org.ga4gh", "artifact": "tes", "version": "1.1.0"},
+        "organization": {"name": "Example", "url": "https://example.org"},
+        "version": "1.0.0"
+    })
+    .to_string()
+}
+
 /// A TES service-info response beneath `root`.
 fn service_info(root: &str) -> Mock {
     mock("GET", format!("/{root}/ga4gh/tes/v1/service-info").as_str())
         .with_status(200)
-        .with_body(
-            json!({
-                "id": "org.example.tes",
-                "name": "Example TES",
-                "type": {"group": "org.ga4gh", "artifact": "tes", "version": "1.1.0"},
-                "organization": {"name": "Example", "url": "https://example.org"},
-                "version": "1.0.0"
-            })
-            .to_string(),
-        )
+        .with_body(service_info_body())
         .create()
 }
 
@@ -57,9 +60,15 @@ fn example_task() -> TesTask {
 
 #[tokio::test]
 async fn usage_client_shares_the_tes_clients_transport() {
-    let _info = service_info("shared");
-    // Only the injected HTTP client sends this header, so the usage request
-    // proves that the client is shared, not just the configuration.
+    // Only the injected HTTP client sends this header, so the service-info
+    // and usage requests prove that the client is shared, not just the
+    // configuration.
+    let info = mock("GET", "/shared/ga4gh/tes/v1/service-info")
+        .match_header("x-client", "injected")
+        .with_status(200)
+        .with_body(service_info_body())
+        .expect(1)
+        .create();
     let _usage = mock("GET", "/shared/ga4gh/tes/v1/tasks/task%201/usage")
         .match_header("x-client", "injected")
         .with_status(200)
@@ -72,10 +81,14 @@ async fn usage_client_shares_the_tes_clients_transport() {
         .default_headers(headers)
         .build()
         .unwrap();
-    let mut tes = TES::new(&config).await.unwrap();
-    tes.transport = Transport::with_client(&config, client);
+    let tes = TES::with_transport(Transport::with_client(&config, client))
+        .await
+        .unwrap();
+    info.assert();
+    assert_eq!(tes.configuration().base_path, config.base_path);
+    assert_eq!(tes.discovered_service_info().id, "org.example.tes");
 
-    let usage = UsageClient::from_transport(tes.transport.clone())
+    let usage = UsageClient::from_transport(tes.transport().clone())
         .task_usage("task 1")
         .await
         .unwrap();
@@ -118,7 +131,7 @@ async fn usage_client_shares_configured_auth_with_tes() {
     let tes = TES::new(&config).await.unwrap();
     info.assert();
 
-    let usage = UsageClient::from_transport(tes.transport.clone())
+    let usage = UsageClient::from_transport(tes.transport().clone())
         .task_usage("task-1")
         .await
         .unwrap();
@@ -258,7 +271,15 @@ fn cli_keeps_the_built_in_commands_and_adds_its_own() {
         assert!(tes.find_subcommand(name).is_some(), "missing tes {name}");
     }
     for name in [
-        "drs", "trs", "wes", "workflow", "registry", "login", "logout", "quota",
+        "drs",
+        "trs",
+        "wes",
+        "workflow",
+        "registry",
+        "service-info",
+        "login",
+        "logout",
+        "quota",
     ] {
         assert!(command.find_subcommand(name).is_some(), "missing {name}");
     }
@@ -367,6 +388,21 @@ fn cli_binary_reads_the_config_file_for_added_and_built_in_commands() {
         .match_header("authorization", "Bearer from-file")
         .with_body(r#"{"cpu_hours":3}"#)
         .create();
+    // The built-in `service-info` command reads the binary's own sections too.
+    let _quota_info = mock("GET", "/cli-run-quota/service-info")
+        .match_header("authorization", "Bearer from-file")
+        .with_body(
+            json!({
+                "id": "org.example.quota",
+                "name": "Example quota",
+                "type": {"group": "org.example", "artifact": "quota", "version": "1.0.0"},
+                "organization": {"name": "Example", "url": "https://example.org"},
+                "version": "1.0.0",
+                "x-limit": 3
+            })
+            .to_string(),
+        )
+        .create();
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir(home.path().join(".downstream-cli")).unwrap();
     std::fs::write(
@@ -383,6 +419,10 @@ fn cli_binary_reads_the_config_file_for_added_and_built_in_commands() {
         (vec!["tes", "usage", "task-1"], "task-1\t-\t5\n"),
         (vec!["tes", "list"], "task-from-sdk"),
         (vec!["quota"], "{\"cpu_hours\":3}"),
+        (
+            vec!["service-info", "--service", cli::QUOTA_SECTION],
+            "\"x-limit\":3",
+        ),
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_downstream-cli"))
             .args(&args)
