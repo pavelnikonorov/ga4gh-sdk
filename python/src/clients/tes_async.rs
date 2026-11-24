@@ -76,12 +76,11 @@ pub async fn connected(tes: &LazyTES, transport: &Transport) -> Result<Arc<TES>,
 
 /// A TES client for `asyncio`: `create`, `get` and `list` return awaitables.
 ///
-/// `AsyncTES(config)` doesn't contact the server; its first call checks the service, as
-/// `TES(config)` does. `await AsyncTES.connect(config)` checks it right away. Subclass it to
-/// add endpoints, using `self.transport`.
-///
-/// `transport` is the client's state: the built-in calls connect with it, and the `config`
-/// getter reads its configuration.
+/// The methods return `asyncio.Future`s of the running event loop, so they must be called
+/// from it. `AsyncTES(config)` doesn't contact the server; `await AsyncTES.connect(config)`
+/// first checks that `config` points at a TES service; otherwise the first call does.
+/// Invalid arguments raise when a method is called; failed requests raise `RuntimeError`
+/// when awaited. Cancelling an awaitable drops its request.
 #[pyclass(name = "AsyncTES", module = "ga4gh_sdk", subclass)]
 pub struct PyAsyncTES {
     /// The configuration that the client was built with, kept for compatibility. The SDK
@@ -132,10 +131,16 @@ impl PyAsyncTES {
         Ok(Self::new(config))
     }
 
-    /// Builds `cls(config, *args, **kwargs)` and gives it once it has checked the service.
+    /// Builds `cls(config, *args, **kwargs)`; gives it once it has checked the service.
     ///
-    /// The client is built at once, on the event loop's thread. The check raises
-    /// `RuntimeError` when awaited if it fails, like `TES(config)`.
+    /// Args:
+    ///     config: The service's configuration.
+    ///     *args: Further arguments of a subclass's constructor.
+    ///     **kwargs: Further keyword arguments of a subclass's constructor.
+    ///
+    /// Returns:
+    ///     A future of the client; it raises `RuntimeError` if the service isn't
+    ///     reachable or isn't a TES.
     #[classmethod]
     #[pyo3(signature = (config, *args, **kwargs))]
     fn connect<'py>(
@@ -160,7 +165,7 @@ impl PyAsyncTES {
         })
     }
 
-    /// The client's configuration: that of its transport.
+    /// The client's configuration.
     #[getter]
     fn config(&self) -> PyConfiguration {
         PyConfiguration {
@@ -168,7 +173,7 @@ impl PyAsyncTES {
         }
     }
 
-    /// The client's transport, for further endpoints.
+    /// A transport with the client's configuration; its methods are synchronous.
     #[getter]
     fn transport(&self) -> PyTransport {
         PyTransport {
@@ -176,7 +181,17 @@ impl PyAsyncTES {
         }
     }
 
-    /// Creates a task; gives an `AsyncTask` for it. Takes the same `task` as `TES.create()`.
+    /// Creates a task; takes the same `task` as `TES.create()`.
+    ///
+    /// Args:
+    ///     task: A `TesTask`, a `dict` (or other mapping), or the path of a JSON file.
+    ///
+    /// Returns:
+    ///     A future of the created task.
+    ///
+    /// Raises:
+    ///     ValueError: The task is invalid.
+    ///     OSError: The task file can't be read.
     pub fn create<'py>(&self, task: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
         let py = task.py();
         let task = task_to_create(task, "AsyncTES.create()")?;
@@ -191,8 +206,17 @@ impl PyAsyncTES {
         })
     }
 
-    /// Gets a task; gives a `TesTask`. `view` is `"MINIMAL"`, `"BASIC"` or `"FULL"`, in any
-    /// case; others raise `ValueError` when the method is called.
+    /// Gets a task.
+    ///
+    /// Args:
+    ///     view: `"MINIMAL"`, `"BASIC"` or `"FULL"`, in any case.
+    ///     id: The task's ID.
+    ///
+    /// Returns:
+    ///     A future of the task in that view.
+    ///
+    /// Raises:
+    ///     ValueError: `view` is not a TES view.
     pub fn get<'py>(
         &self,
         py: Python<'py>,
@@ -210,7 +234,13 @@ impl PyAsyncTES {
         })
     }
 
-    /// Lists tasks, one page at a time; gives a `ListTasksResponse`.
+    /// Lists tasks, one page at a time.
+    ///
+    /// Args:
+    ///     params: Filters and paging; by default, the first page of all tasks.
+    ///
+    /// Returns:
+    ///     A future of the page.
     #[pyo3(signature = (params=None))]
     pub fn list<'py>(
         &self,
@@ -229,7 +259,7 @@ impl PyAsyncTES {
     }
 }
 
-/// A TES task on the server, addressed by its ID, for `asyncio`: its methods return awaitables.
+/// A TES task on the server, addressed by its ID, for `asyncio`.
 #[pyclass(name = "AsyncTask", module = "ga4gh_sdk", subclass)]
 pub struct PyAsyncTask {
     pub inner: Task,
@@ -259,6 +289,7 @@ impl PyAsyncTask {
         Ok(Self::new(id, transport))
     }
 
+    /// The task's ID.
     #[getter]
     fn id(&self) -> String {
         self.inner.id.clone()
@@ -272,7 +303,10 @@ impl PyAsyncTask {
         }
     }
 
-    /// Gives the task's current state, as a `TesState`.
+    /// Gets the task's current state.
+    ///
+    /// Returns:
+    ///     A future of the state; it raises `RuntimeError` if the request fails.
     pub fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let task = self.inner.clone();
         future_into_py(py, async move {
@@ -283,7 +317,10 @@ impl PyAsyncTask {
         })
     }
 
-    /// Asks the server to cancel the task; gives `None`.
+    /// Asks the server to cancel the task.
+    ///
+    /// Returns:
+    ///     A future of `None`; it raises `RuntimeError` if the request fails.
     pub fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let task = self.inner.clone();
         future_into_py(py, async move {
@@ -294,12 +331,25 @@ impl PyAsyncTask {
         })
     }
 
-    /// Waits until the task ends; takes the same arguments as `Task.wait()` and gives the
-    /// same result.
+    /// Waits until the task ends, like `Task.wait()`.
     ///
-    /// Invalid arguments raise `ValueError` when the method is called. Cancelling the
-    /// awaiting coroutine stops polling; it doesn't cancel the task. Between polls, the
-    /// wait holds no call thread, so other async calls don't queue behind it.
+    /// Cancelling the awaiting coroutine stops polling; it doesn't cancel the task.
+    /// Between polls, the wait holds no call thread, so sleeping waits do not delay other
+    /// async calls.
+    ///
+    /// Args:
+    ///     timeout: The most seconds for the whole wait; `None` waits as long as it takes.
+    ///     poll_interval: The seconds between the first polls.
+    ///     max_interval: The longest interval between polls; by default 10 seconds, or
+    ///         `poll_interval` if that's longer.
+    ///     view: `"MINIMAL"`, `"BASIC"` or `"FULL"`, to get the ended task in that view.
+    ///
+    /// Returns:
+    ///     A future of the final state, or of the ended task in `view`. It raises
+    ///     `WaitTimeoutError` when the time runs out and `RuntimeError` if a poll fails.
+    ///
+    /// Raises:
+    ///     ValueError: An argument is invalid, when the method is called.
     #[pyo3(signature = (timeout=None, *, poll_interval=1.0, max_interval=None, view=None))]
     pub fn wait<'py>(
         &self,
@@ -391,28 +441,31 @@ pub async fn wait_task_send(task: Task, settings: WaitSettings) -> WaitEnd {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mockito::{mock, Matcher, Mock};
+    use ga4gh_sdk::utils::operation::Operation;
+    use mockito::{Matcher, Mock};
+    use std::time::Duration;
     use url::Url;
 
     /// The user agent of the transport that a test gives the client.
     const OWNED_AGENT: &str = "owned-transport";
 
     /// A configuration for the API root `/<root>/ga4gh/tes/v1` on the mock server.
-    fn config(root: &str) -> Configuration {
-        let root = format!("{}/{root}/ga4gh/tes/v1", mockito::server_url());
+    fn config(server: &mockito::ServerGuard, root: &str) -> Configuration {
+        let root = format!("{}/{root}/ga4gh/tes/v1", server.url());
         Configuration::new(Url::parse(&root).unwrap())
     }
 
     /// A client built with a transport whose user agent is [`OWNED_AGENT`].
-    fn client_with_owned_transport(root: &str) -> PyAsyncTES {
-        let config = config(root).with_user_agent(OWNED_AGENT.to_owned());
+    fn client_with_owned_transport(server: &mockito::ServerGuard, root: &str) -> PyAsyncTES {
+        let config = config(server, root).with_user_agent(OWNED_AGENT.to_owned());
         PyAsyncTES::with_transport(Transport::new(&config))
     }
 
     /// A mock of the service info of a TES beneath `root` that expects one request with
     /// [`OWNED_AGENT`]; call `create()` on it to serve it.
-    fn service_info(root: &str, status: usize) -> Mock {
-        mock("GET", format!("/{root}/ga4gh/tes/v1/service-info").as_str())
+    fn service_info(server: &mut mockito::ServerGuard, root: &str, status: usize) -> Mock {
+        server
+            .mock("GET", format!("/{root}/ga4gh/tes/v1/service-info").as_str())
             .match_header("user-agent", OWNED_AGENT)
             .with_status(status)
             .with_body(
@@ -430,26 +483,29 @@ mod tests {
 
     #[tokio::test]
     async fn lazy_client_shares_transport() {
-        let info = service_info("shared-transport", 200).create();
-        let created = mock("POST", "/shared-transport/ga4gh/tes/v1/tasks")
+        let mut server = mockito::Server::new_async().await;
+        let info = service_info(&mut server, "shared-transport", 200).create();
+        let created = server
+            .mock("POST", "/shared-transport/ga4gh/tes/v1/tasks")
             .match_header("user-agent", OWNED_AGENT)
             .match_body(Matcher::Json(serde_json::json!({"executors": []})))
             .with_status(200)
             .with_body(r#"{"id":"task-1"}"#)
             .expect(1)
             .create();
-        let fetched = mock(
-            "GET",
-            "/shared-transport/ga4gh/tes/v1/tasks/task-1?view=MINIMAL",
-        )
-        .match_header("user-agent", OWNED_AGENT)
-        .with_status(200)
-        .with_body(r#"{"id":"task-1","state":"QUEUED"}"#)
-        .expect(1)
-        .create();
-        let mut client = client_with_owned_transport("shared-transport");
+        let fetched = server
+            .mock(
+                "GET",
+                "/shared-transport/ga4gh/tes/v1/tasks/task-1?view=MINIMAL",
+            )
+            .match_header("user-agent", OWNED_AGENT)
+            .with_status(200)
+            .with_body(r#"{"id":"task-1","state":"QUEUED"}"#)
+            .expect(1)
+            .create();
+        let mut client = client_with_owned_transport(&server, "shared-transport");
         // A Rust extension can still change the public copy; the client doesn't read it.
-        client.config = config("shared-transport");
+        client.config = config(&server, "shared-transport");
         let (tes, transport) = client.connection();
 
         let connected_client = connected(&tes, &transport).await.unwrap();
@@ -471,9 +527,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_keeps_operation_errors_for_the_waiter() {
+        let mut server = mockito::Server::new_async().await;
+        // An operation that has already ended sends no request.
+        let poll = server
+            .mock("GET", Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+        let task = Task::new(
+            "task-1".to_owned(),
+            Transport::new(&config(&server, "ended")),
+        );
+        let options = RequestOptions {
+            operation: Operation::new(Duration::from_secs(60)),
+            retry: Default::default(),
+            safety: ReplaySafety::ReadOnly,
+            limits: BodyLimits::default(),
+        };
+        options.operation.cancellation.cancel();
+
+        let error = poll_on_call_thread(task, options).await.unwrap_err();
+
+        assert_eq!(
+            error.downcast_ref::<OperationError>(),
+            Some(&OperationError::Cancelled)
+        );
+        poll.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn concurrent_first_calls_connect_once_with_the_transport() {
-        let info = service_info("concurrent-transport", 200).create();
-        let client = client_with_owned_transport("concurrent-transport");
+        let mut server = mockito::Server::new_async().await;
+        let info = service_info(&mut server, "concurrent-transport", 200).create();
+        let client = client_with_owned_transport(&server, "concurrent-transport");
         let (tes, transport) = client.connection();
 
         let (first, second) =
@@ -485,9 +572,10 @@ mod tests {
 
     #[tokio::test]
     async fn failed_connection_is_retried_with_the_same_transport() {
-        let client = client_with_owned_transport("retried-transport");
+        let mut server = mockito::Server::new_async().await;
+        let client = client_with_owned_transport(&server, "retried-transport");
         let (tes, transport) = client.connection();
-        let failed = service_info("retried-transport", 500).create();
+        let failed = service_info(&mut server, "retried-transport", 500).create();
 
         let error = connected(&tes, &transport).await.err().unwrap();
 
@@ -496,8 +584,8 @@ mod tests {
             error.starts_with("Failed to create TES instance"),
             "{error}"
         );
-        drop(failed);
-        let info = service_info("retried-transport", 200).create();
+        failed.remove();
+        let info = service_info(&mut server, "retried-transport", 200).create();
 
         connected(&tes, &transport).await.unwrap();
 
@@ -506,15 +594,16 @@ mod tests {
 
     #[tokio::test]
     async fn client_with_transport_connects_with_the_injected_http_client() {
+        let mut server = mockito::Server::new_async().await;
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("x-http-client", "injected".parse().unwrap());
         let http = reqwest::Client::builder()
             .default_headers(headers)
             .build()
             .unwrap();
-        let config = config("injected-client").with_user_agent(OWNED_AGENT.to_owned());
+        let config = config(&server, "injected-client").with_user_agent(OWNED_AGENT.to_owned());
         let client = PyAsyncTES::with_transport(Transport::with_client(&config, http));
-        let info = service_info("injected-client", 200)
+        let info = service_info(&mut server, "injected-client", 200)
             .match_header("x-http-client", "injected")
             .create();
         let (tes, transport) = client.connection();

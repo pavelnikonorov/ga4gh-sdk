@@ -9,7 +9,7 @@ use ga4gh_sdk::{
     },
     utils::{configuration::Configuration, operation::Operation, transport::Transport},
 };
-use mockito::{mock, server_url, Matcher};
+use mockito::Matcher;
 use std::{
     pin::Pin,
     sync::{
@@ -44,10 +44,11 @@ fn request() -> RunRequest {
 }
 #[tokio::test]
 async fn sources_preserve_nested_filenames_content_and_shared_header_policy() {
+    let mut server = mockito::Server::new_async().await;
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("tool.cwl");
     std::fs::write(&file, "file contents").unwrap();
-    let wes = wes(&server_url());
+    let wes = wes(&server.url());
     let mut headers = ga4gh_sdk::reqwest::header::HeaderMap::new();
     headers.insert("authorization", "Bearer test-only".parse().unwrap());
     let transport = Transport::with_client(
@@ -58,13 +59,15 @@ async fn sources_preserve_nested_filenames_content_and_shared_header_policy() {
             .unwrap(),
     );
     let wes = WES::without_discovery(transport, wes.discovered_service_info().clone());
-    let json = mock("POST", "/json")
+    let json = server
+        .mock("POST", "/json")
         .match_header("authorization", "Bearer test-only")
         .with_body("{}")
         .expect(1)
         .create();
     wes.transport().post("json", None).await.unwrap();
-    let upload = mock("POST", "/runs")
+    let upload = server
+        .mock("POST", "/runs")
         .match_header("authorization", "Bearer test-only")
         .match_body(Matcher::AllOf(vec![
             Matcher::Regex("filename=\"main.cwl\"".into()),
@@ -100,6 +103,23 @@ async fn sources_preserve_nested_filenames_content_and_shared_header_policy() {
     );
     json.assert();
     upload.assert();
+}
+#[tokio::test]
+async fn duplicate_filenames_fail_before_any_request() {
+    // No mock: a request would get mockito's 501 instead of the error below.
+    let server = mockito::Server::new_async().await;
+    let files = ["main.cwl", "main.cwl"]
+        .into_iter()
+        .map(|filename| StreamingAttachment {
+            filename: filename.into(),
+            source: AttachmentSource::Bytes(b"contents".to_vec()),
+        })
+        .collect();
+    let error = wes(&server.url())
+        .run_workflow_streaming(request(), files, &Operation::new(Duration::from_secs(3)))
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "duplicate workflow attachment filename");
 }
 struct Generated {
     read: Arc<AtomicUsize>,
@@ -202,10 +222,11 @@ async fn reader_failure_and_invalid_paths_are_actionable_without_replay() {
         )
         .await
         .unwrap_err();
-    assert!(
-        error.to_string().contains("injected reader failure"),
-        "{error}"
-    );
+    let ambiguous = error
+        .downcast_ref::<ga4gh_sdk::utils::operation::AmbiguousSubmissionError>()
+        .expect("a failed streamed submission has an uncertain remote outcome");
+    assert_eq!(ambiguous.reason, "HTTP request failed");
+    assert!(!error.to_string().contains("injected reader failure"));
     server.await.unwrap();
     for filename in [
         "../escape",
@@ -232,15 +253,20 @@ async fn reader_failure_and_invalid_paths_are_actionable_without_replay() {
 
 #[tokio::test]
 async fn streamed_submission_validates_acknowledgement_once() {
+    let mut server = mockito::Server::new_async().await;
     use ga4gh_sdk::utils::acknowledgement::AcknowledgementError;
-    let wes = wes(&server_url());
+    let wes = wes(&server.url());
     for body in [
         "{}",
         r#"{"run_id":null}"#,
         r#"{"run_id":4}"#,
         r#"{"run_id":""}"#,
     ] {
-        let post = mock("POST", "/runs").with_body(body).expect(1).create();
+        let post = server
+            .mock("POST", "/runs")
+            .with_body(body)
+            .expect(1)
+            .create();
         let error = wes
             .run_workflow_streaming(
                 request(),

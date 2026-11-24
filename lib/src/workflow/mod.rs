@@ -36,16 +36,34 @@ pub type ContractError = crate::Error;
 /// The revision of the GA4GH I/O profile and widget vocabulary schemas that
 /// this crate embeds; [`Pins::reference`] pins both to it.
 pub const PROFILE_REVISION: &str = "45d41324353cb4900fdd999c307c2e36a3f2a410";
-const FRAGMENT: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
-    .add(b' ')
-    .add(b'%')
-    .add(b'#')
-    .add(b'?')
-    .add(b'"')
-    .add(b'<')
-    .add(b'>')
-    .add(b'`')
-    .add(b'\\');
+/// The ASCII characters that a URI fragment can't hold as they are, so that
+/// any JSON Pointer to a schema works in a `$ref` (RFC 3986: `fragment =
+/// *( pchar / "/" / "?" )`). Everything except the unreserved characters,
+/// the sub-delimiters, `:`, `@`, `/` and `?` is encoded; bytes outside ASCII
+/// always are.
+const FRAGMENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    // unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~"
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    // sub-delims = "!" / "$" / "&" / "'" / "(" / ")" / "*" / "+" / "," / ";" / "="
+    .remove(b'!')
+    .remove(b'$')
+    .remove(b'&')
+    .remove(b'\'')
+    .remove(b'(')
+    .remove(b')')
+    .remove(b'*')
+    .remove(b'+')
+    .remove(b',')
+    .remove(b';')
+    .remove(b'=')
+    // the rest of pchar, and the two characters that fragment adds
+    .remove(b':')
+    .remove(b'@')
+    .remove(b'/')
+    .remove(b'?');
 const DRAFT: &str = "https://json-schema.org/draft/2020-12/schema";
 const PROFILE_URI: &str = "https://raw.githubusercontent.com/uniqueg/ga4gh-io-schema/main/schemas/ga4gh-io-profile.schema.json";
 const WIDGET_URI: &str = "https://raw.githubusercontent.com/uniqueg/ga4gh-io-schema/main/schemas/vocabularies/ui-widgets.schema.json";
@@ -90,7 +108,11 @@ impl Retrieve for LocalResources {
 }
 /// Returns the SHA-256 of `bytes` as 64 lowercase hex digits.
 pub fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    // sha2 0.11 digests no longer implement `LowerHex`.
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 // Explicit recursive sorting also remains stable if a consumer enables serde_json's
 // preserve_order feature through Cargo feature unification.
@@ -494,4 +516,17 @@ impl PreparedInvocation {
 }
 pub(crate) fn pointer_segment(s: &str) -> String {
     s.replace('~', "~0").replace('/', "~1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::digest;
+
+    #[test]
+    fn digest_is_lowercase_hex_of_sha256() {
+        assert_eq!(
+            digest(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }

@@ -49,6 +49,22 @@ jobs:
       - name: Build CLI alone
         run: cargo build --locked -p ga4gh-cli
 
+  # Known advisories (RustSec) for the crates in `Cargo.lock`; accepted ones
+  # are listed with a reason in `deny.toml`.
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Check advisories
+        run: cargo deny --locked check advisories
+
   python:
     name: Python tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
@@ -183,9 +199,9 @@ jobs:
         if: matrix.suite == 'keycloak' && steps.changes.outputs.run == 'true'
         run: tests/run-keycloak-integration.sh
 
-  # Coverage of the unit tests, without the generated models; the report
-  # goes to the job summary and the `coverage` artifact (LCOV), which the
-  # `codecov` job uploads
+  # Coverage of the Rust unit tests and the Python binding tests, without
+  # the generated models; the report goes to the job summary and the
+  # `coverage` artifact (LCOV), which the `codecov` job uploads
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
@@ -198,17 +214,35 @@ jobs:
         run: |
           rustup toolchain install
           rustup component add llvm-tools-preview
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-llvm-cov@0.9.1
+      # The lowest supported Python version of the `python` job
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.11'
+      # The versions of the `python` job
+      - name: Install Maturin and pytest
+        run: python -m pip install 'maturin==1.16.0' 'pytest==9.0.3'
+      - name: Test the report filter
+        run: python -m pytest utils
       - name: Measure coverage
-        run: make coverage
+        run: make coverage PYTHON=python
       - name: Write job summary
         run: |
           {
             echo '## Coverage'
             echo
-            echo 'Unit tests, without documentation tests and generated models.'
+            echo 'Rust unit tests and Python binding tests, without documentation'
+            echo 'tests and generated models.'
+            echo
+            echo 'Lines as Codecov counts them, without the PyO3 attribute lines:'
+            echo
+            echo '```text'
+            cat coverage/lines.txt
+            echo '```'
+            echo
+            echo 'All metrics of cargo-llvm-cov, with the PyO3 attribute lines:'
             echo
             echo '```text'
             cat coverage/summary.txt
@@ -320,7 +354,7 @@ jobs:
 
   passed:
     name: CI passed
-    needs: [lint, test, build, python, wheels, binaries, image, integration, coverage, codecov, pre-commit, docs, downstream]
+    needs: [lint, test, build, advisories, python, wheels, binaries, image, integration, coverage, codecov, pre-commit, docs, downstream]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -339,8 +373,8 @@ jobs:
           for name, result in results.items():
               print(f'{name}: {result}')
           expected = {
-              'lint', 'test', 'build', 'python', 'wheels', 'binaries', 'image', 'integration',
-              'coverage', 'codecov', 'pre-commit', 'docs', 'downstream',
+              'lint', 'test', 'build', 'advisories', 'python', 'wheels', 'binaries', 'image',
+              'integration', 'coverage', 'codecov', 'pre-commit', 'docs', 'downstream',
           }
           expected_results = {name: 'success' for name in expected}
           if os.environ['EVENT_NAME'] == 'pull_request':

@@ -4,11 +4,13 @@
 // The CLI locates its config through HOME, which Windows does not use.
 #![cfg(unix)]
 
-use mockito::{mock, Matcher, Mock};
+use mockito::{Matcher, Mock};
 use serde_json::{json, Value};
+use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -17,22 +19,22 @@ use tempfile::TempDir;
 /// Bytes that aren't valid UTF-8, to check that files are saved unchanged.
 const BINARY: &[u8] = b"\x00\xff\xfe binary \x80\n";
 
-fn home_with_tes(prefix: &str) -> TempDir {
+fn home_with_tes(server: &mockito::ServerGuard, prefix: &str) -> TempDir {
     let home = TempDir::new().unwrap();
     let directory = home.path().join(".ga4gh-cli");
     fs::create_dir(&directory).unwrap();
     let config = json!({"TES": {
-        "base_path": format!("{}{prefix}", mockito::server_url()),
+        "base_path": format!("{}{prefix}", server.url()),
         "oauth_access_token": "tes-token",
     }});
     fs::write(directory.join("config.json"), config.to_string()).unwrap();
     home
 }
 
-fn home_with_short_timeout(prefix: &str) -> TempDir {
-    let home = home_with_tes(prefix);
+fn home_with_short_timeout(server: &mockito::ServerGuard, prefix: &str) -> TempDir {
+    let home = home_with_tes(server, prefix);
     let config = json!({"TES": {
-        "base_path": format!("{}{prefix}", mockito::server_url()),
+        "base_path": format!("{}{prefix}", server.url()),
         "timeouts": {"request": 1, "connect": 1},
     }});
     fs::write(
@@ -43,11 +45,17 @@ fn home_with_short_timeout(prefix: &str) -> TempDir {
     home
 }
 
-fn run(home: &TempDir, args: &[&str]) -> Output {
-    run_with_s3_endpoint(home, args, &mockito::server_url())
+fn run(server: &mockito::ServerGuard, home: &TempDir, args: &[&str]) -> Output {
+    run_with_s3_endpoint(home, args, &server.url())
 }
 
 fn run_with_s3_endpoint(home: &TempDir, args: &[&str], endpoint: &str) -> Output {
+    s3_command(home, args, endpoint).output().unwrap()
+}
+
+/// The CLI with `args`, the configuration in `home`, no proxies, and unsigned
+/// S3 requests to `endpoint`.
+fn s3_command(home: &TempDir, args: &[&str], endpoint: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ga4gh-cli"));
     command.args(args).env("HOME", home.path());
     for proxy in [
@@ -73,7 +81,7 @@ fn run_with_s3_endpoint(home: &TempDir, args: &[&str], endpoint: &str) -> Output
         .env("AWS_ALLOW_HTTP", "true")
         .env("AWS_SKIP_SIGNATURE", "true")
         .env("AWS_REGION", "us-east-1");
-    command.output().unwrap()
+    command
 }
 
 fn stdout(output: &Output) -> String {
@@ -85,7 +93,7 @@ fn stderr(output: &Output) -> String {
 }
 
 /// Mocks the service info and the `FULL` view of task `t1` below `prefix`.
-fn tes_mocks(prefix: &str, task: &Value) -> Vec<Mock> {
+fn tes_mocks(server: &mut mockito::ServerGuard, prefix: &str, task: &Value) -> Vec<Mock> {
     let service_info = json!({
         "id": "org.example.tes",
         "name": "Mock",
@@ -94,11 +102,13 @@ fn tes_mocks(prefix: &str, task: &Value) -> Vec<Mock> {
         "version": "1.0.0",
     });
     vec![
-        mock("GET", format!("{prefix}/service-info").as_str())
+        server
+            .mock("GET", format!("{prefix}/service-info").as_str())
             .with_status(200)
             .with_body(service_info.to_string())
             .create(),
-        mock("GET", format!("{prefix}/tasks/t1?view=FULL").as_str())
+        server
+            .mock("GET", format!("{prefix}/tasks/t1?view=FULL").as_str())
             .with_status(200)
             .with_body(task.to_string())
             .create(),
@@ -107,8 +117,8 @@ fn tes_mocks(prefix: &str, task: &Value) -> Vec<Mock> {
 
 /// A complete task with inline logs and HTTP and S3 output files. The size of
 /// `file:0:2` is wrong on purpose.
-fn complete_task(prefix: &str) -> Value {
-    let storage = format!("{}{prefix}/storage", mockito::server_url());
+fn complete_task(server: &mockito::ServerGuard, prefix: &str) -> Value {
+    let storage = format!("{}{prefix}/storage", server.url());
     json!({
         "id": "t1",
         "state": "COMPLETE",
@@ -133,32 +143,37 @@ fn complete_task(prefix: &str) -> Value {
     })
 }
 
-fn storage_mocks(prefix: &str) -> Vec<Mock> {
+fn storage_mocks(server: &mut mockito::ServerGuard, prefix: &str) -> Vec<Mock> {
     vec![
         // No TES credentials may reach the storage host.
-        mock("GET", format!("{prefix}/storage/out.bin").as_str())
+        server
+            .mock("GET", format!("{prefix}/storage/out.bin").as_str())
             .match_header("authorization", Matcher::Missing)
             .with_status(200)
             .with_body(BINARY)
             .create(),
-        mock("GET", format!("{prefix}/storage/short.txt").as_str())
+        server
+            .mock("GET", format!("{prefix}/storage/short.txt").as_str())
             .with_status(200)
             .with_body("short")
             .create(),
-        mock(
-            "GET",
-            Matcher::Regex(format!("^{prefix}/storage/missing.txt")),
-        )
-        .with_status(403)
-        .with_body("denied")
-        .create(),
-        mock("GET", format!("/bucket{prefix}/result.bin").as_str())
+        server
+            .mock(
+                "GET",
+                Matcher::Regex(format!("^{prefix}/storage/missing.txt")),
+            )
+            .with_status(403)
+            .with_body("denied")
+            .create(),
+        server
+            .mock("GET", format!("/bucket{prefix}/result.bin").as_str())
             .with_status(200)
             .with_header("ETag", "\"abc\"")
             .with_header("Last-Modified", "Wed, 11 Nov 2026 10:00:00 GMT")
             .with_body(b"s3\x00\xffok")
             .create(),
-        mock("GET", format!("/bucket{prefix}/absent.bin").as_str())
+        server
+            .mock("GET", format!("/bucket{prefix}/absent.bin").as_str())
             .with_status(404)
             .with_body("<Error><Code>NoSuchKey</Code></Error>")
             .create(),
@@ -192,10 +207,12 @@ fn no_headers_server() -> (String, std::thread::JoinHandle<()>) {
 
 #[test]
 fn files_lists_selectors_and_hides_url_secrets() {
+    let mut server = mockito::Server::new();
     let prefix = "/files-list";
-    let _tes = tes_mocks(prefix, &complete_task(prefix));
-    let home = home_with_tes(prefix);
-    let output = run(&home, &["tes", "files", "t1"]);
+    let task = complete_task(&server, prefix);
+    let _tes = tes_mocks(&mut server, prefix, &task);
+    let home = home_with_tes(&server, prefix);
+    let output = run(&server, &home, &["tes", "files", "t1"]);
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
     for selector in [
@@ -251,30 +268,48 @@ fn error_logs_are_shown_without_rust_log() {
         "{}",
         stderr(&output)
     );
+    // `RUST_LOG` without directives leaves env_logger's default level.
+    for filters in ["", "debug/a/b"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ga4gh-cli"))
+            .args(["tes", "files", "t1"])
+            .env("HOME", home.path())
+            .env("RUST_LOG", filters)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            stderr(&output).contains(" ERROR ga4gh_sdk"),
+            "{filters}: {}",
+            stderr(&output)
+        );
+    }
 }
 
 #[test]
 fn debug_logs_omit_redirected_signed_urls() {
+    let mut server = mockito::Server::new();
     let prefix = "/save-redirect";
-    let storage = format!("{}{prefix}/storage", mockito::server_url());
+    let storage = format!("{}{prefix}/storage", server.url());
     let task = json!({"id": "t1", "state": "COMPLETE", "logs": [{"logs": [], "outputs": [
         {"url": format!("{storage}/signed?X-Amz-Signature=SECRET1"), "path": "/o/r.bin", "size_bytes": "2"}
     ]}]});
-    let _tes = tes_mocks(prefix, &task);
+    let _tes = tes_mocks(&mut server, prefix, &task);
     let _storage = [
-        mock("GET", Matcher::Regex(format!("^{prefix}/storage/signed")))
+        server
+            .mock("GET", Matcher::Regex(format!("^{prefix}/storage/signed")))
             .with_status(302)
             .with_header(
                 "location",
                 &format!("{storage}/target?X-Amz-Signature=SECRET2"),
             )
             .create(),
-        mock("GET", Matcher::Regex(format!("^{prefix}/storage/target")))
+        server
+            .mock("GET", Matcher::Regex(format!("^{prefix}/storage/target")))
             .with_status(200)
             .with_body("ok")
             .create(),
     ];
-    let home = home_with_tes(prefix);
+    let home = home_with_tes(&server, prefix);
     for (index, filters) in ["trace", "trace,notreqwest=trace"].into_iter().enumerate() {
         let dir = home.path().join(format!("results-{index}"));
         let mut command = Command::new(env!("CARGO_BIN_EXE_ga4gh-cli"));
@@ -302,11 +337,55 @@ fn debug_logs_omit_redirected_signed_urls() {
 }
 
 #[test]
+fn http_library_debug_logs_need_the_exact_target_name() {
+    let mut server = mockito::Server::new();
+    let prefix = "/log-targets";
+    let _tes = tes_mocks(
+        &mut server,
+        prefix,
+        &json!({"id": "t1", "state": "COMPLETE"}),
+    );
+    let home = home_with_tes(&server, prefix);
+    let reqwest_debug_lines = |filters: &str| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ga4gh-cli"));
+        command
+            .args(["tes", "files", "t1"])
+            .env("HOME", home.path())
+            .env("RUST_LOG", filters);
+        for proxy in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+            command.env_remove(proxy);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{filters}: {}", stderr(&output));
+        // This relies on the log format in `main.rs`. hyper logs through
+        // `tracing` without its `log` feature, so only reqwest can be seen.
+        stderr(&output)
+            .lines()
+            .filter(|line| line.contains(" DEBUG reqwest") || line.contains(" TRACE reqwest"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    // With the exact name, the user's level applies.
+    assert!(!reqwest_debug_lines("trace,reqwest=trace").is_empty());
+    // env_logger reads `reqwest ` (with a space) as a name of its own, so the
+    // global level doesn't reach reqwest. The unit tests cover other cases.
+    for filters in ["trace", "trace,reqwest =info", "trace, reqwest = info"] {
+        let lines = reqwest_debug_lines(filters);
+        assert!(lines.is_empty(), "{filters}: {lines:?}");
+    }
+}
+
+#[test]
 fn files_reports_an_incomplete_task() {
+    let mut server = mockito::Server::new();
     let prefix = "/files-incomplete";
-    let _tes = tes_mocks(prefix, &json!({"id": "t1", "state": "RUNNING"}));
-    let home = home_with_tes(prefix);
-    let output = run(&home, &["tes", "files", "t1"]);
+    let _tes = tes_mocks(
+        &mut server,
+        prefix,
+        &json!({"id": "t1", "state": "RUNNING"}),
+    );
+    let home = home_with_tes(&server, prefix);
+    let output = run(&server, &home, &["tes", "files", "t1"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "SELECTOR       SIZE       DESCRIPTION\n");
     assert_eq!(
@@ -315,7 +394,7 @@ fn files_reports_an_incomplete_task() {
          Note: The task has no logs yet.\n"
     );
 
-    let output = run(&home, &["tes", "log", "t1", "stdout:0:0"]);
+    let output = run(&server, &home, &["tes", "log", "t1", "stdout:0:0"]);
     assert_eq!(output.status.code(), Some(1));
     let message = stderr(&output);
     assert!(message.contains("The task has no stdout:0:0"), "{message}");
@@ -324,28 +403,33 @@ fn files_reports_an_incomplete_task() {
 
 #[test]
 fn log_shows_inline_logs_escaped() {
+    let mut server = mockito::Server::new();
     let prefix = "/log-show";
-    let _tes = tes_mocks(prefix, &complete_task(prefix));
-    let home = home_with_tes(prefix);
-    let output = run(&home, &["tes", "log", "t1", "stdout:0:0"]);
+    let task = complete_task(&server, prefix);
+    let _tes = tes_mocks(&mut server, prefix, &task);
+    let home = home_with_tes(&server, prefix);
+    let output = run(&server, &home, &["tes", "log", "t1", "stdout:0:0"]);
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "line 1\nline 2 \\u{1b}[31mred\n");
-    let output = run(&home, &["tes", "log", "t1", "system:0"]);
+    let output = run(&server, &home, &["tes", "log", "t1", "system:0"]);
     assert_eq!(stdout(&output), "image pulled\n");
-    let output = run(&home, &["tes", "log", "t1", "file:0:0"]);
+    let output = run(&server, &home, &["tes", "log", "t1", "file:0:0"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("tes save"), "{}", stderr(&output));
 }
 
 #[test]
 fn save_writes_logs_and_files_byte_for_byte() {
+    let mut server = mockito::Server::new();
     let prefix = "/save-ok";
-    let _tes = tes_mocks(prefix, &complete_task(prefix));
-    let _storage = storage_mocks(prefix);
-    let home = home_with_tes(prefix);
+    let task = complete_task(&server, prefix);
+    let _tes = tes_mocks(&mut server, prefix, &task);
+    let _storage = storage_mocks(&mut server, prefix);
+    let home = home_with_tes(&server, prefix);
     let dir = home.path().join("results");
     let dir_arg = dir.to_str().unwrap();
     let output = run(
+        &server,
         &home,
         &[
             "tes",
@@ -385,7 +469,11 @@ fn save_writes_logs_and_files_byte_for_byte() {
 
     // An existing file is kept unless --force is given.
     fs::write(dir.join("out.bin"), "old").unwrap();
-    let output = run(&home, &["tes", "save", "t1", "file:0:0", "--dir", dir_arg]);
+    let output = run(
+        &server,
+        &home,
+        &["tes", "save", "t1", "file:0:0", "--dir", dir_arg],
+    );
     assert_eq!(output.status.code(), Some(1));
     assert!(
         stderr(&output).contains("already exists; use --force"),
@@ -394,6 +482,7 @@ fn save_writes_logs_and_files_byte_for_byte() {
     );
     assert_eq!(fs::read(dir.join("out.bin")).unwrap(), b"old");
     let output = run(
+        &server,
         &home,
         &["tes", "save", "t1", "file:0:0", "--dir", dir_arg, "--force"],
     );
@@ -401,6 +490,7 @@ fn save_writes_logs_and_files_byte_for_byte() {
     assert_eq!(fs::read(dir.join("out.bin")).unwrap(), BINARY);
 
     let output = run(
+        &server,
         &home,
         &[
             "tes", "save", "t1", "output:0", "--dir", dir_arg, "--name", "copy.bin",
@@ -412,10 +502,11 @@ fn save_writes_logs_and_files_byte_for_byte() {
 
 #[test]
 fn a_file_output_with_an_empty_path_prefix_is_saved() {
+    let mut server = mockito::Server::new();
     // Some servers, such as Funnel, send `path_prefix: ""` for single-file
     // outputs.
     let prefix = "/save-empty-prefix";
-    let storage = format!("{}{prefix}/storage", mockito::server_url());
+    let storage = format!("{}{prefix}/storage", server.url());
     let task = json!({
         "id": "t1",
         "state": "COMPLETE",
@@ -426,10 +517,10 @@ fn a_file_output_with_an_empty_path_prefix_is_saved() {
             "type": "FILE",
         }],
     });
-    let _tes = tes_mocks(prefix, &task);
-    let _storage = storage_mocks(prefix);
-    let home = home_with_tes(prefix);
-    let output = run(&home, &["tes", "files", "t1"]);
+    let _tes = tes_mocks(&mut server, prefix, &task);
+    let _storage = storage_mocks(&mut server, prefix);
+    let home = home_with_tes(&server, prefix);
+    let output = run(&server, &home, &["tes", "files", "t1"]);
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
     assert!(text.contains("declared output file"), "{text}");
@@ -437,6 +528,7 @@ fn a_file_output_with_an_empty_path_prefix_is_saved() {
 
     let dir = home.path().join("results");
     let output = run(
+        &server,
         &home,
         &[
             "tes",
@@ -453,10 +545,12 @@ fn a_file_output_with_an_empty_path_prefix_is_saved() {
 
 #[test]
 fn failed_downloads_leave_no_file() {
+    let mut server = mockito::Server::new();
     let prefix = "/save-errors";
-    let _tes = tes_mocks(prefix, &complete_task(prefix));
-    let _storage = storage_mocks(prefix);
-    let home = home_with_tes(prefix);
+    let task = complete_task(&server, prefix);
+    let _tes = tes_mocks(&mut server, prefix, &task);
+    let _storage = storage_mocks(&mut server, prefix);
+    let home = home_with_tes(&server, prefix);
     let dir = home.path().join("results");
     let dir_arg = dir.to_str().unwrap();
     let cases = [
@@ -472,7 +566,11 @@ fn failed_downloads_leave_no_file() {
         ("output:1", "directory or a pattern"),
     ];
     for (selector, expected) in cases {
-        let output = run(&home, &["tes", "save", "t1", selector, "--dir", dir_arg]);
+        let output = run(
+            &server,
+            &home,
+            &["tes", "save", "t1", selector, "--dir", dir_arg],
+        );
         let message = stderr(&output);
         assert_eq!(output.status.code(), Some(1), "{selector}: {message}");
         assert!(message.contains(expected), "{selector}: {message}");
@@ -485,6 +583,7 @@ fn failed_downloads_leave_no_file() {
 
     // Selections are checked before any download: nothing is saved.
     let output = run(
+        &server,
         &home,
         &[
             "tes", "save", "t1", "file:0:0", "file:0:9", "--dir", dir_arg,
@@ -500,6 +599,7 @@ fn failed_downloads_leave_no_file() {
 
     // Saving stops at the first failure and reports what was saved before.
     let output = run(
+        &server,
         &home,
         &[
             "tes", "save", "t1", "file:0:0", "file:0:3", "file:0:1", "--dir", dir_arg,
@@ -516,6 +616,7 @@ fn failed_downloads_leave_no_file() {
 
 #[test]
 fn an_interrupted_download_leaves_no_file() {
+    let mut mock_server = mockito::Server::new();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
@@ -528,12 +629,13 @@ fn an_interrupted_download_leaves_no_file() {
     });
     let prefix = "/save-interrupted";
     let task = json!({"id": "t1", "state": "COMPLETE", "logs": [{
-        "logs": [], "outputs": [{"url": format!("http://{address}/big.bin"), "path": "/o/big.bin", "size_bytes": "1000"}]
+        "logs": [], "outputs": [{"url": format!("http://{address}/big.bin?token=SENTINEL"), "path": "/o/big.bin", "size_bytes": "1000"}]
     }]});
-    let _tes = tes_mocks(prefix, &task);
-    let home = home_with_tes(prefix);
+    let _tes = tes_mocks(&mut mock_server, prefix, &task);
+    let home = home_with_tes(&mock_server, prefix);
     let dir = home.path().join("results");
     let output = run(
+        &mock_server,
         &home,
         &[
             "tes",
@@ -548,13 +650,17 @@ fn an_interrupted_download_leaves_no_file() {
     let message = stderr(&output);
     assert_eq!(output.status.code(), Some(1), "{message}");
     assert!(message.contains("interrupted after 12 bytes"), "{message}");
+    assert!(message.contains("HTTP response body failed"), "{message}");
+    assert!(!message.contains("end of file"), "{message}");
+    assert!(!message.contains("SENTINEL"), "{message}");
     assert!(entries(&dir).is_empty(), "{:?}", entries(&dir));
 }
 
 #[test]
 fn invalid_input_fails_before_the_service_is_contacted() {
+    let server = mockito::Server::new();
     // No mocks below this prefix: a request would fail differently.
-    let home = home_with_tes("/no-service");
+    let home = home_with_tes(&server, "/no-service");
     let dir = home.path().join("results");
     let dir_arg = dir.to_str().unwrap();
     let cases: [(&[&str], &str); 4] = [
@@ -587,18 +693,19 @@ fn invalid_input_fails_before_the_service_is_contacted() {
         ),
     ];
     for (args, expected) in cases {
-        let output = run(&home, args);
+        let output = run(&server, &home, args);
         let message = stderr(&output);
         assert_eq!(output.status.code(), Some(1), "{args:?}: {message}");
         assert!(message.contains(expected), "{args:?}: {message}");
     }
-    let output = run(&home, &["tes", "save", "t1", "file:0:0"]);
+    let output = run(&server, &home, &["tes", "save", "t1", "file:0:0"]);
     assert_eq!(output.status.code(), Some(2), "--dir is required");
     assert!(!dir.exists());
 }
 
 #[test]
 fn a_stalled_download_times_out_and_leaves_no_file() {
+    let mut mock_server = mockito::Server::new();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
@@ -615,10 +722,10 @@ fn a_stalled_download_times_out_and_leaves_no_file() {
     let task = json!({"id": "t1", "state": "COMPLETE", "logs": [{
         "logs": [], "outputs": [{"url": format!("http://{address}/slow.bin"), "path": "/o/slow.bin", "size_bytes": "1000"}]
     }]});
-    let _tes = tes_mocks(prefix, &task);
-    let home = home_with_tes(prefix);
+    let _tes = tes_mocks(&mut mock_server, prefix, &task);
+    let home = home_with_tes(&mock_server, prefix);
     let config = json!({"TES": {
-        "base_path": format!("{}{prefix}", mockito::server_url()),
+        "base_path": format!("{}{prefix}", mock_server.url()),
         "timeouts": {"request": 1},
     }});
     fs::write(
@@ -629,6 +736,7 @@ fn a_stalled_download_times_out_and_leaves_no_file() {
     let dir = home.path().join("results");
     let started = Instant::now();
     let output = run(
+        &mock_server,
         &home,
         &[
             "tes",
@@ -652,16 +760,18 @@ fn a_stalled_download_times_out_and_leaves_no_file() {
 
 #[test]
 fn an_http_server_without_headers_times_out_and_leaves_no_file() {
+    let mut mock_server = mockito::Server::new();
     let (storage, server) = no_headers_server();
     let prefix = "/save-http-no-headers";
     let task = json!({"id": "t1", "state": "COMPLETE", "logs": [{
         "logs": [], "outputs": [{"url": format!("{storage}/hang.bin"), "path": "/o/hang.bin"}]
     }]});
-    let _tes = tes_mocks(prefix, &task);
-    let home = home_with_short_timeout(prefix);
+    let _tes = tes_mocks(&mut mock_server, prefix, &task);
+    let home = home_with_short_timeout(&mock_server, prefix);
     let dir = home.path().join("results");
     let started = Instant::now();
     let output = run(
+        &mock_server,
         &home,
         &[
             "tes",
@@ -681,13 +791,14 @@ fn an_http_server_without_headers_times_out_and_leaves_no_file() {
 
 #[test]
 fn an_s3_server_without_headers_times_out_and_leaves_no_file() {
+    let mut mock_server = mockito::Server::new();
     let (storage, server) = no_headers_server();
     let prefix = "/save-s3-no-headers";
     let task = json!({"id": "t1", "state": "COMPLETE", "logs": [{
         "logs": [], "outputs": [{"url": "s3://bucket/hang.bin", "path": "/o/hang.bin"}]
     }]});
-    let _tes = tes_mocks(prefix, &task);
-    let home = home_with_short_timeout(prefix);
+    let _tes = tes_mocks(&mut mock_server, prefix, &task);
+    let home = home_with_short_timeout(&mock_server, prefix);
     let dir = home.path().join("results");
     let started = Instant::now();
     let output = run_with_s3_endpoint(
@@ -711,9 +822,11 @@ fn an_s3_server_without_headers_times_out_and_leaves_no_file() {
 
 #[test]
 fn force_replaces_a_symlink_without_writing_through_it() {
+    let mut server = mockito::Server::new();
     let prefix = "/save-symlink";
-    let _tes = tes_mocks(prefix, &complete_task(prefix));
-    let home = home_with_tes(prefix);
+    let task = complete_task(&server, prefix);
+    let _tes = tes_mocks(&mut server, prefix, &task);
+    let home = home_with_tes(&server, prefix);
     let dir = home.path().join("results");
     fs::create_dir(&dir).unwrap();
     let outside = home.path().join("outside.txt");
@@ -721,6 +834,7 @@ fn force_replaces_a_symlink_without_writing_through_it() {
     std::os::unix::fs::symlink(&outside, dir.join("stdout-0-0.txt")).unwrap();
     let dir_arg = dir.to_str().unwrap();
     let output = run(
+        &server,
         &home,
         &["tes", "save", "t1", "stdout:0:0", "--dir", dir_arg],
     );
@@ -731,6 +845,7 @@ fn force_replaces_a_symlink_without_writing_through_it() {
         stderr(&output)
     );
     let output = run(
+        &server,
         &home,
         &[
             "tes",
@@ -749,4 +864,177 @@ fn force_replaces_a_symlink_without_writing_through_it() {
         .symlink_metadata()
         .unwrap()
         .is_symlink());
+}
+
+#[test]
+fn s3_downloads_report_configuration_and_request_errors() {
+    let mut server = mockito::Server::new();
+    let prefix = "/save-s3-errors";
+    let task = json!({"id": "t1", "state": "COMPLETE", "logs": [{"logs": [], "outputs": [
+        {"url": format!("s3://bucket{prefix}/denied.bin"), "path": "/o/denied.bin"},
+        {"url": format!("s3://bucket{prefix}/ok.bin"), "path": "/o/ok.bin"},
+    ]}]});
+    let _tes = tes_mocks(&mut server, prefix, &task);
+    let _storage = [
+        server
+            .mock("GET", format!("/bucket{prefix}/denied.bin").as_str())
+            .with_status(403)
+            .with_body("<Error><Code>AccessDenied</Code></Error>")
+            .create(),
+        server
+            .mock("GET", format!("/bucket{prefix}/ok.bin").as_str())
+            .with_status(200)
+            .with_header("ETag", "\"abc\"")
+            .with_header("Last-Modified", "Wed, 11 Nov 2026 10:00:00 GMT")
+            .with_body("ok")
+            .create(),
+    ];
+    let home = home_with_tes(&server, prefix);
+    let dir = home.path().join("results");
+    let save = |selector: &str| {
+        s3_command(
+            &home,
+            &[
+                "tes",
+                "save",
+                "t1",
+                selector,
+                "--dir",
+                dir.to_str().unwrap(),
+            ],
+            &server.url(),
+        )
+    };
+
+    let output = save("file:0:0").output().unwrap();
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{message}");
+    assert!(
+        message.contains(&format!(
+            "Request for s3://bucket{prefix}/denied.bin failed"
+        )),
+        "{message}"
+    );
+
+    // A key ID without a secret key is an invalid static credential.
+    let output = save("file:0:1")
+        .env("AWS_ACCESS_KEY_ID", "key-id")
+        .output()
+        .unwrap();
+    let message = stderr(&output);
+    assert_eq!(output.status.code(), Some(1), "{message}");
+    assert!(message.contains("Can't configure S3 access"), "{message}");
+    assert!(entries(&dir).is_empty(), "{:?}", entries(&dir));
+
+    // Variables that aren't Unicode are skipped, not a reason to fail.
+    let output = save("file:0:1")
+        .env(OsStr::from_bytes(b"AWS_\xff"), "value")
+        .env("NOT_AWS", OsStr::from_bytes(b"\xff"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(fs::read(dir.join("ok.bin")).unwrap(), b"ok");
+}
+
+/// Answers one S3 request with `response` and then stops listening, so that
+/// retries are refused. The server thread panics if no request arrives
+/// within 30 seconds, so that joining it can't hang.
+fn one_response_server(response: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let timeout = std::time::Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + timeout;
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "no S3 request within {timeout:?}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream.set_read_timeout(Some(timeout)).unwrap();
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        stream.write_all(&response).unwrap();
+    });
+    (format!("http://{address}"), server)
+}
+
+#[test]
+fn s3_downloads_that_break_off_or_end_early_leave_no_file() {
+    let mut mock_server = mockito::Server::new();
+    let prefix = "/save-s3-short";
+    let task = json!({"id": "t1", "state": "COMPLETE", "logs": [{"logs": [], "outputs": [
+        {"url": "s3://bucket/big.bin", "path": "/o/big.bin"},
+    ]}]});
+    let _tes = tes_mocks(&mut mock_server, prefix, &task);
+    let home = home_with_tes(&mock_server, prefix);
+    let dir = home.path().join("results");
+    let headers =
+        "HTTP/1.1 200 OK\r\nETag: \"abc\"\r\nLast-Modified: Wed, 11 Nov 2026 10:00:00 GMT\r\n";
+    // The body is shorter than its length; and a chunked body ends before
+    // the length that the server states for the object.
+    let cases = [
+        (
+            format!("{headers}Content-Length: 1000\r\n\r\npartial data"),
+            "Download of s3://bucket/big.bin was interrupted after 12 bytes",
+        ),
+        (
+            format!(
+                "{headers}Content-Length: 10\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n0\r\n\r\n"
+            ),
+            "Download of s3://bucket/big.bin ended after 5 of 10 bytes",
+        ),
+    ];
+    for (response, expected) in cases {
+        let (endpoint, server) = one_response_server(response.into_bytes());
+        let output = run_with_s3_endpoint(
+            &home,
+            &[
+                "tes",
+                "save",
+                "t1",
+                "file:0:0",
+                "--dir",
+                dir.to_str().unwrap(),
+            ],
+            &endpoint,
+        );
+        server.join().unwrap();
+        let message = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{message}");
+        assert!(message.contains(expected), "{message}");
+        assert!(entries(&dir).is_empty(), "{:?}", entries(&dir));
+    }
+}
+
+#[test]
+fn named_http_library_targets_keep_their_debug_logs() {
+    let mut server = mockito::Server::new();
+    let prefix = "/files-debug-logs";
+    let _tes = tes_mocks(
+        &mut server,
+        prefix,
+        &json!({"id": "t1", "state": "COMPLETE"}),
+    );
+    let home = home_with_tes(&server, prefix);
+    let output = s3_command(&home, &["tes", "files", "t1"], &server.url())
+        // The exact name: a filter that the CLI adds for an unnamed library
+        // replaces this directive, while a child target such as
+        // `reqwest::connect` would win against it as the longer match (the
+        // unit tests of `names_log_target` cover child targets).
+        .env("RUST_LOG", "reqwest=debug")
+        .output()
+        .unwrap();
+    let message = stderr(&output);
+    assert!(output.status.success(), "{message}");
+    assert!(message.contains(" DEBUG reqwest::connect]"), "{message}");
 }

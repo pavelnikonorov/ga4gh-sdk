@@ -1,27 +1,29 @@
 use ga4gh_sdk::{
+    clients::trs::{models::DescriptorType, responses},
     reqwest::Method,
     utils::{
         configuration::Configuration,
         transport::{read_bounded, BodyLimitError, BodyLimits, Transport},
     },
 };
-use mockito::{mock, server_url};
 
-fn transport() -> Transport {
-    Transport::new(&Configuration::new(url::Url::parse(&server_url()).unwrap()))
+fn transport(server: &mockito::ServerGuard) -> Transport {
+    Transport::new(&Configuration::new(url::Url::parse(&server.url()).unwrap()))
 }
 
 #[tokio::test]
 async fn binary_and_metadata_survive_before_parsing() {
+    let mut server = mockito::Server::new_async().await;
     let bytes = vec![0x50, 0x4b, 3, 4, 0xff, 0xfe, 0, 0x80];
-    let request = mock("GET", "/zip")
+    let request = server
+        .mock("GET", "/zip")
         .with_status(202)
         .with_header("retry-after", "1")
         .with_header("content-type", "application/zip")
         .with_header("next_page", "opaque+token/%")
         .with_body(bytes.clone())
         .create();
-    let response = transport()
+    let response = transport(&server)
         .request_response(Method::GET, "zip", None, None)
         .await
         .unwrap();
@@ -36,13 +38,15 @@ async fn binary_and_metadata_survive_before_parsing() {
 
 #[tokio::test]
 async fn success_and_error_bounds_preserve_status() {
+    let mut server = mockito::Server::new_async().await;
     for status in [200, 503] {
         let path = format!("/limit{status}");
-        let request = mock("GET", path.as_str())
+        let request = server
+            .mock("GET", path.as_str())
             .with_status(status)
             .with_body("x".repeat(1024))
             .create();
-        let error = transport()
+        let error = transport(&server)
             .request_text(
                 Method::GET,
                 &path,
@@ -115,20 +119,23 @@ async fn chunked_bodies_are_bounded_without_a_length() {
 
 #[tokio::test]
 async fn trs_pagination_uses_urls_and_zip_is_opaque() {
+    let mut server = mockito::Server::new_async().await;
     use ga4gh_sdk::clients::trs::{
         models::DescriptorType,
         responses::{files_zip, list_tools_page, next_tools_page},
     };
-    let next = format!("{}/tools?offset=opaque%2B%2F%25&limit=2", server_url());
-    let first = mock("GET", "/tools")
+    let next = format!("{}/tools?offset=opaque%2B%2F%25&limit=2", server.url());
+    let first = server
+        .mock("GET", "/tools")
         .with_header("next_page", &next)
         .with_body("[]")
         .create();
-    let second = mock("GET", "/tools?offset=opaque%2B%2F%25&limit=2")
+    let second = server
+        .mock("GET", "/tools?offset=opaque%2B%2F%25&limit=2")
         .with_body("[]")
         .expect(1)
         .create();
-    let transport = transport();
+    let transport = transport(&server);
     let page = list_tools_page(&transport, None, BodyLimits::default())
         .await
         .unwrap();
@@ -152,7 +159,8 @@ async fn trs_pagination_uses_urls_and_zip_is_opaque() {
     first.assert();
     second.assert();
     let bytes = include_bytes!("../../tests/fixtures/trs/workflow.zip").to_vec();
-    let zip = mock("GET", "/tools/a%2Fb/versions/v%201/CWL/files?format=zip")
+    let zip = server
+        .mock("GET", "/tools/a%2Fb/versions/v%201/CWL/files?format=zip")
         .with_body(bytes.clone())
         .with_header("content-type", "application/zip")
         .expect(1)
@@ -164,13 +172,14 @@ async fn trs_pagination_uses_urls_and_zip_is_opaque() {
     zip.assert();
 
     // Unrecognized descriptor types are one encoded path segment.
-    let unrecognized = mock(
-        "GET",
-        "/tools/a%2Fb/versions/v%201/CWL%2Ffiles%3Fformat%3Djson/files?format=zip",
-    )
-    .with_body(bytes.clone())
-    .expect(1)
-    .create();
+    let unrecognized = server
+        .mock(
+            "GET",
+            "/tools/a%2Fb/versions/v%201/CWL%2Ffiles%3Fformat%3Djson/files?format=zip",
+        )
+        .with_body(bytes.clone())
+        .expect(1)
+        .create();
     let descriptor = DescriptorType::Unrecognized("CWL/files?format=json".into());
     let response = files_zip(&transport, "a/b", "v 1", descriptor)
         .await
@@ -231,15 +240,17 @@ async fn dropping_a_response_stops_the_producer() {
 
 #[tokio::test]
 async fn trs_relative_page_link_keeps_configured_basic_auth_scoped_to_the_api() {
+    let mut server = mockito::Server::new_async().await;
     use ga4gh_sdk::clients::trs::responses::next_tools_page;
     use ga4gh_sdk::utils::configuration::BasicAuth;
     let transport = Transport::new(
-        &Configuration::new(url::Url::parse(&server_url()).unwrap()).with_basic_auth(BasicAuth {
+        &Configuration::new(url::Url::parse(&server.url()).unwrap()).with_basic_auth(BasicAuth {
             username: "user".into(),
             password: Some("pass".into()),
         }),
     );
-    let request = mock("GET", "/tools?offset=opaque")
+    let request = server
+        .mock("GET", "/tools?offset=opaque")
         .match_header("authorization", "Basic dXNlcjpwYXNz")
         .with_body("[]")
         .expect(1)
@@ -256,11 +267,13 @@ async fn trs_relative_page_link_keeps_configured_basic_auth_scoped_to_the_api() 
 
 #[tokio::test]
 async fn strict_json_validates_utf8_even_in_ignored_properties() {
-    let request = mock("GET", "/strict-json-ignored-utf8")
+    let mut server = mockito::Server::new_async().await;
+    let request = server
+        .mock("GET", "/strict-json-ignored-utf8")
         .with_status(200)
         .with_body(b"{\"ignored\":\"\xff\"}")
         .create();
-    let response = transport()
+    let response = transport(&server)
         .request_response(Method::GET, "strict-json-ignored-utf8", None, None)
         .await
         .unwrap();
@@ -272,4 +285,36 @@ async fn strict_json_validates_utf8_even_in_ignored_properties() {
     .expect_err("invalid UTF-8 must not be skipped with an unknown field");
     assert!(error.downcast_ref::<std::str::Utf8Error>().is_some());
     request.assert();
+}
+
+/// A next-page link without a query fetches the plain tools list.
+#[tokio::test]
+async fn tools_links_without_a_query_list_all_tools() {
+    let mut server = mockito::Server::new_async().await;
+    let request = server
+        .mock("GET", "/tools")
+        .match_query(mockito::Matcher::Missing)
+        .with_body("[]")
+        .expect(1)
+        .create();
+    let page = responses::next_tools_page(&transport(&server), "tools", BodyLimits::default())
+        .await
+        .unwrap();
+    assert!(page.tools.is_empty());
+    request.assert();
+}
+
+#[tokio::test]
+async fn zip_requests_reject_empty_and_dot_ids_before_sending() {
+    let server = mockito::Server::new_async().await;
+    let transport = transport(&server);
+    for (tool, version) in [("", "1"), ("tool", ""), (".", "1"), ("tool", "..")] {
+        let error = responses::files_zip(&transport, tool, version, DescriptorType::Cwl)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "TRS tool/version IDs must be nonempty opaque segments"
+        );
+    }
 }

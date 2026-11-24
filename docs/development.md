@@ -29,11 +29,15 @@ linked issues own current remediation status.
   cargo install cargo-llvm-cov --locked --version 0.9.1
   ```
 
+- For the advisory check:
+  [cargo-deny](https://github.com/EmbarkStudios/cargo-deny), with
+  `cargo install cargo-deny --locked --version 0.20.2` (see
+  [Dependency advisories](#dependency-advisories)).
 - For the hooks: [pre-commit](https://pre-commit.com/), for example with
   `python3 -m pip install 'pre-commit==4.7.0'` or `pipx install pre-commit`.
 
-CI uses the versions above (cargo-llvm-cov 0.9.1, pre-commit 4.7.0). They
-are pinned in [`ci.yml`](../.github/workflows/ci.yml) and Dependabot does not
+CI uses the versions above (cargo-llvm-cov 0.9.1, cargo-deny 0.20.2,
+pre-commit 4.7.0). They are pinned in [`ci.yml`](../.github/workflows/ci.yml) and Dependabot does not
 bump them, so update this guide when you change them.
 
 ## Make targets
@@ -49,7 +53,7 @@ bump them, so update this guide when you change them.
 | `make clippy` | `cargo clippy --workspace --all-targets --locked -- -D warnings` |
 | `make lint` | `fmt-check` and `clippy` |
 | `make check` | `lint`, `build` and `test`: the standard checks |
-| `make coverage` | Coverage report in `coverage/` (see below) |
+| `make coverage` | Coverage report of the Rust and Python tests in `coverage/` (see below) |
 | `make clean-coverage` | Removes coverage data and `coverage/` |
 | `make downstream` | Formatting, Clippy and tests of the [downstream example](downstream.md#checks) |
 | `make docs` | `cargo doc --workspace --no-deps --locked` (in `target/doc/`) |
@@ -98,21 +102,68 @@ pinned hook revisions.
 
 ## Coverage
 
-`make coverage` runs the unit tests with
-[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) and writes:
+`make coverage` measures the Rust unit tests and the
+[Python binding tests](../python/README.md#running-tests) with
+[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov). It runs
+`cargo test --workspace`, builds the bindings with maturin and installs them
+into `target/coverage-site/`, and runs pytest in `python/` with that
+directory on `PYTHONPATH`. All of these
+builds are instrumented, so the report shows the binding code that the
+Python tests reach. It writes:
 
 - `coverage/lcov.info`: the LCOV report, for editors and coverage services
-- `coverage/summary.txt`: the summary table, which it also prints
+- `coverage/summary.txt`: the summary table of cargo-llvm-cov, which it also
+  prints
+- `coverage/lines.txt`: the covered lines per directory, as Codecov counts
+  them
 
-The report leaves out the generated models. Documentation tests (which
-cargo-llvm-cov only measures on nightly Rust) and the opt-in integration
-suites are not included. For an HTML report of the same data, run this after
-`make coverage`:
+Besides the [prerequisites](#prerequisites) for coverage, it needs a Python
+3.11+ environment with maturin, pip and pytest. `PYTHON` names its
+interpreter (`python3` by default). `make coverage` doesn't install
+anything into that environment; a virtual environment of its own keeps the
+tools apart from other projects:
 
 ```sh
-cargo llvm-cov report --html --open \
-  --ignore-filename-regex 'lib/src/clients/[^/]+/(wire/[^/]+/)?models/'
+python3 -m venv target/coverage-venv
+target/coverage-venv/bin/python -m pip install 'maturin>=1.7,<2' pytest
+make coverage PYTHON=target/coverage-venv/bin/python
 ```
+
+The instrumented builds use cargo-llvm-cov's target directory, `target/`,
+which the normal builds use as well, so switching between `make coverage`
+and `make check` or `make test` can rebuild the workspace crates.
+`make clean-coverage` removes the measurements and the instrumented
+bindings.
+
+The report leaves out the generated models and
+`lib/src/utils/test_utils.rs`: the crate ships it as a public module, but
+only the Funnel integration suite uses it. Documentation tests (which
+cargo-llvm-cov only measures on nightly Rust) and the opt-in integration
+suites are not included.
+
+[`utils/lcov_filter.py`](../utils/lcov_filter.py) also leaves out the
+`#[pymethods]` and `#[pyclass]` lines of `python/src/` from
+`coverage/lcov.info`, with their line and function records. PyO3 generates
+a wrapper for each Python method, and the instrumentation counts these
+wrappers on the attribute's line, always as not executed, even when tests
+call the methods. The code of the methods is counted on its own lines.
+`coverage/summary.txt` still includes the attribute lines. Run the filter's
+tests with `python3 -m pytest utils`.
+
+For an HTML report of the same data, run this after `make coverage`. The
+report must use cargo-llvm-cov's environment, as `make coverage` does, to
+find the measurements; the subshell keeps that environment out of your
+shell:
+
+```sh
+(
+  eval "$(cargo llvm-cov show-env --sh)"
+  cargo llvm-cov report --html --open \
+    --ignore-filename-regex 'lib/src/clients/[^/]+/(wire/[^/]+/)?models/|lib/src/utils/test_utils\.rs$'
+)
+```
+
+The HTML report includes the PyO3 attribute lines.
 
 In CI, the `codecov` job uploads `coverage/lcov.info` from the `coverage`
 job to [Codecov](https://codecov.io/gh/ga4gh/ga4gh-sdk), which shows the
@@ -185,7 +236,7 @@ Docs project is configured as described below, it serves `latest` from
 - [`.readthedocs.yaml`](../.readthedocs.yaml) configures the build on Read the
   Docs: the dependency group `docs` of
   [`python/pyproject.toml`](../python/pyproject.toml) (exact versions;
-  Dependabot doesn't bump them, so update them by hand), rustup for the
+  review each Dependabot update for new build warnings), rustup for the
   pinned toolchain, `cargo doc`, then MkDocs.
 
 A new guide needs an entry in `nav`; link to it with its relative path, as
@@ -217,7 +268,11 @@ make site
 
 `python/tests/test_stubs.py`, which the `Python tests` job runs, checks that
 every class and member of the stubs has a docstring and that the `Args:`
-section of each method names all of its parameters.
+section of each method names all of its parameters. It also compares class,
+method and property docstrings from the stubs with those that `help()` shows,
+which PyO3 builds from the Rust doc comments: change both together. It
+leaves out `__init__` (PyO3 drops its doc comment), slots such as `__len__`,
+and attributes and enum members, which have no runtime docstring of their own.
 
 The Griffe extension `docs/griffe_overloads.py` renders methods that the
 stubs declare only with `@overload`, such as `Task.wait`.
@@ -259,12 +314,13 @@ on pushes to `main` and on manual dispatch:
 | `lint` | Lint | `cargo fmt --all --check`, `cargo clippy` with `-D warnings` |
 | `test` | Test | `cargo test --workspace --locked` |
 | `build` | Build | Lockfile check, standalone library and CLI builds |
+| `advisories` | Advisories | `cargo deny --locked check advisories` (see [Dependency advisories](#dependency-advisories)) |
 | `python` | Python tests | Builds and installs the wheel, runs `pytest` in `python/` |
 | `wheels` | Python wheels | Full platform wheel and sdist matrix on `main` pushes and manual runs; skipped on PRs |
 | `binaries` | CLI binaries | Builds and runs `ga4gh-cli` on the six release platforms on `main` pushes and manual runs; skipped on PRs |
 | `image` | CLI image | Builds the [CLI image](container-image.md) for `linux/amd64` and `linux/arm64` and runs `tests/run-image-tests.sh` (with Funnel on `linux/amd64`); runs on PRs too |
 | `integration` | Integration (*suite*) | Integration suites when their files change |
-| `coverage` | Coverage | `make coverage`; summary in the job summary, LCOV report as the `coverage` artifact |
+| `coverage` | Coverage | Tests `utils/`, then `make coverage`; summary in the job summary, LCOV report as the `coverage` artifact |
 | `codecov` | Upload coverage | Uploads the `coverage` artifact to Codecov; upload errors don't fail it |
 | `pre-commit` | Pre-commit | All hooks except the Rust ones, which `lint` runs |
 | `docs` | Docs | `make site`: the Rust API reference, without rustdoc warnings, and the strict MkDocs build |
@@ -282,6 +338,30 @@ For a PR that changes packaging, native dependencies, supported platforms or the
 workflows, open **Actions → CI → Run workflow**, select the PR branch and run
 the full matrices before merging. Check the wheel, sdist and CLI binary jobs.
 The manual run builds artifacts but does not publish them.
+
+## Dependency advisories
+
+The `advisories` job checks every crate in `Cargo.lock`, with all features,
+against the [RustSec advisory database](https://rustsec.org/): known
+vulnerabilities, and crates marked unmaintained or unsound. It runs on every
+pull request and push to `main`, so a new advisory fails the next run even
+without a change to the dependencies. To run it locally with
+[cargo-deny](#prerequisites):
+
+```sh
+cargo deny --locked check advisories
+```
+
+When it fails, update the crate (`cargo update -p <crate>`, or a new version
+in a `Cargo.toml`). If no fixed version is usable yet, add the advisory ID
+to `ignore` in [`deny.toml`](../deny.toml) with a reason: why it doesn't
+affect the SDK, or what it waits for. cargo-deny warns about an entry that
+no longer matches; remove such entries.
+
+[Dependabot](../.github/dependabot.yml) opens weekly PRs for the crates
+(semver-compatible updates in one PR) and for `python/pyproject.toml`, besides
+GitHub Actions, pre-commit hooks and base images. It also raises security
+alerts for the repository.
 
 ## Issue and pull request templates
 

@@ -1,9 +1,8 @@
 //! Compile and exercise the public CLI extension point as a downstream crate.
 
 use clap::{Arg, Command};
-use ga4gh_cli::{command, dispatch, dispatch_with_config};
+use ga4gh_cli::{command, dispatch, dispatch_with_config, dispatch_with_config_to};
 use ga4gh_sdk::utils::configuration::Configuration;
-use mockito::mock;
 use url::Url;
 
 #[tokio::test]
@@ -15,6 +14,19 @@ async fn downstream_command_can_be_parsed_and_dispatched() {
 
     // The SDK CLI leaves commands it does not own to the downstream caller.
     assert!(dispatch(&matches).await.unwrap().is_none());
+    let config = Configuration::default();
+    assert!(dispatch_with_config(&matches, &config)
+        .await
+        .unwrap()
+        .is_none());
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    assert!(
+        dispatch_with_config_to(&matches, &config, &mut stdout, &mut stderr)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(stdout.is_empty() && stderr.is_empty());
     let output = match matches.subcommand() {
         Some(("custom", args)) => args.get_one::<String>("value").unwrap().to_owned(),
         _ => panic!("custom command was not dispatched"),
@@ -24,16 +36,17 @@ async fn downstream_command_can_be_parsed_and_dispatched() {
 
 #[tokio::test]
 async fn downstream_can_inject_config_and_capture_tes_output() {
-    let _service_info = mock("GET", "/ga4gh/tes/v1/service-info")
+    let mut server = mockito::Server::new_async().await;
+    let _service_info = server.mock("GET", "/ga4gh/tes/v1/service-info")
         .with_status(200)
         .with_body(r#"{"id":"test","name":"Test","type":{"group":"org.ga4gh","artifact":"tes","version":"1.1.0"},"organization":{"name":"Test","url":"https://example.org"},"version":"1.0.0"}"#)
         .create();
-    let _tasks = mock("GET", "/ga4gh/tes/v1/tasks")
+    let _tasks = server
+        .mock("GET", "/ga4gh/tes/v1/tasks")
         .with_status(200)
         .with_body(r#"{"tasks":[{"id":"task-from-test","state":"COMPLETE"}]}"#)
         .create();
-    let config =
-        Configuration::new(Url::parse(&format!("{}/ga4gh/tes/v1", mockito::server_url())).unwrap());
+    let config = Configuration::new(Url::parse(&format!("{}/ga4gh/tes/v1", server.url())).unwrap());
     let matches = command()
         .try_get_matches_from(["ga4gh-cli", "tes", "list"])
         .unwrap();
@@ -49,16 +62,17 @@ async fn downstream_can_inject_config_and_capture_tes_output() {
 
 #[tokio::test]
 async fn downstream_can_inject_config_and_capture_drs_output() {
-    let _service_info = mock("GET", "/ga4gh/drs/v1/service-info")
+    let mut server = mockito::Server::new_async().await;
+    let _service_info = server.mock("GET", "/ga4gh/drs/v1/service-info")
         .with_status(200)
         .with_body(r#"{"id":"test","name":"Test","type":{"group":"org.ga4gh","artifact":"drs","version":"1.4.0"},"organization":{"name":"Test","url":"https://example.org"},"version":"1.0.0"}"#)
         .create();
-    let _object = mock("GET", "/ga4gh/drs/v1/objects/object-id")
+    let _object = server
+        .mock("GET", "/ga4gh/drs/v1/objects/object-id")
         .with_status(200)
         .with_body(r#"{"id":"object-id","created_time":null}"#)
         .create();
-    let config =
-        Configuration::new(Url::parse(&format!("{}/ga4gh/drs/v1", mockito::server_url())).unwrap());
+    let config = Configuration::new(Url::parse(&format!("{}/ga4gh/drs/v1", server.url())).unwrap());
     let matches = command()
         .try_get_matches_from(["ga4gh-cli", "drs", "get", "object-id"])
         .unwrap();

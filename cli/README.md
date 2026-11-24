@@ -121,10 +121,11 @@ submission. `workflow submit` uses the WES section and the same policy as
 `wes run`. Conflicting sources, unsupported `api_key` or URL userinfo, and
 invalid tokens fail before a request. An `_env` field can name a variable that
 holds the token. Keep the file private (`chmod 600 ~/.ga4gh-cli/config.json`).
-SDK-owned clients do not follow redirects. See the
+SDK-owned clients do not follow redirects. A section with `oidc` settings
+gets its tokens from the stored login (see
+[Logging in with OpenID Connect](#logging-in-with-openid-connect)). See the
 [authentication guide](../docs/authentication.md) for the source and redirect
-contracts. Dynamic token-provider integration is tracked in
-[#215](https://github.com/ga4gh/ga4gh-sdk/pull/215).
+contracts, and for the token providers of the Rust and Python APIs.
 
 ### Logging in with OpenID Connect
 
@@ -474,7 +475,12 @@ and each later wait for body data; a download as a whole has no time limit.
 Saved files get the permissions that the umask allows, as with other new files.
 Debug logs of the HTTP libraries
 show full URLs, so the CLI logs them only when `RUST_LOG` names them, for
-example `RUST_LOG=debug,reqwest=debug`.
+example `RUST_LOG=debug,reqwest=debug`. The CLI reads `RUST_LOG` as
+[env_logger](https://docs.rs/env_logger/0.11/env_logger/#enabling-logging)
+does, and only a directive with the exact name (`reqwest`, `hyper` or
+`hyper_util`) and a valid level counts. `RUST_LOG=debug,reqwest::connect=debug`
+logs at debug level for that module only, and `reqwest =debug`, with a space,
+names no target.
 
 Other schemes, such as `file`, `gs` or `ftp`, are refused with an error, and
 so are declared outputs of type `DIRECTORY` or with a wildcard: save the files
@@ -819,8 +825,8 @@ message on stderr and nothing on stdout:
   body; a 404 adds a hint to check that `base_path` is the section's API root;
 - malformed JSON or a JSON value that is not an object is reported as
   `Invalid service info from section '<SECTION>'`;
-- a connection failure or an exceeded `discovery` timeout is reported with
-  its cause.
+- a connection failure or an exceeded `discovery` timeout is reported by
+  category, without exposing the URL or lower-level source text.
 
 Credentials are never printed. A missing or empty `--service` is a usage error
 with exit code 2.
