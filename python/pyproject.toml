@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "ga4gh-sdk"
+name = "ga4gh-sdk-release-rehearsal"
 description = "Python bindings for GA4GH API service clients"
 readme = { text = """
 # GA4GH SDK for Python
