@@ -19,6 +19,39 @@ use std::process::Command;
 use std::process::ExitCode;
 use url::Url;
 
+#[test]
+fn native_extensions_use_explicit_downstream_paths() {
+    use ga4gh_sdk::utils::extension_manager::ExtensionManager;
+
+    fn send_sync<T: Send + Sync>() {}
+    send_sync::<ExtensionManager>();
+    send_sync::<ga4gh_sdk::utils::extension::ResolvedExtension>();
+    send_sync::<ga4gh_sdk::utils::extension::LoadedModule>();
+    send_sync::<ga4gh_sdk::utils::extension::ExtensionInstance>();
+    send_sync::<ga4gh_sdk::utils::extension::ExtensionMethod>();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("extensions.json");
+    let mut config =
+        Configuration::from_provider(figment::providers::Serialized::defaults(json!({
+            "base_path":"https://service.example.org/",
+            "extensions":[
+                {"name":"optional","required":false,"configuration":{}}
+            ]
+        })))
+        .unwrap();
+    // SAFETY: this registry is absent, so no native code can be loaded.
+    let manager = ExtensionManager::with_paths(&path, dir.path().join("native-artifacts")).unwrap();
+    let instances = unsafe { manager.from_configuration(&config) }.unwrap();
+    assert!(instances.is_empty());
+    config.extra["extensions"][0]["required"] = json!(true);
+    let error = unsafe { manager.from_configuration(&config) }.unwrap_err();
+    assert_eq!(
+        error.kind,
+        ga4gh_sdk::utils::extension::ExtensionErrorKind::Missing
+    );
+    assert!(!path.exists());
+}
+
 /// The API root `/<root>/ga4gh/tes/v1` on the mock server.
 fn api_root(server: &mockito::ServerGuard, root: &str) -> String {
     format!("{}/{root}/ga4gh/tes/v1", server.url())
@@ -518,4 +551,107 @@ fn cli_binary_selects_a_profile_for_its_own_command() {
         r#"{"cpu_hours":7}"#
     );
     quota.assert();
+}
+
+#[tokio::test]
+async fn layered_configuration_drives_a_downstream_authenticated_request() {
+    use figment::providers::Serialized;
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    struct Routing {
+        queue: String,
+    }
+    let mut server = mockito::Server::new_async().await;
+    let request = server
+        .mock("GET", "/custom/tasks/task-1/usage")
+        .match_header("authorization", "Bearer downstream-token")
+        .with_body(r#"{"id":"task-1","cpu_seconds":4}"#)
+        .create_async()
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("custom.json");
+    std::fs::write(
+        &path,
+        json!({"profiles":{"site":{"CUSTOM":{
+            "base_path":"https://unused.example.org/", "routing":{"queue":"batch"}
+        }}}})
+        .to_string(),
+    )
+    .unwrap();
+    let sources = Configuration::sources(&path, Some("site"), "CUSTOM")
+        .unwrap()
+        .merge(Serialized::defaults(json!({
+            "base_path":format!("{}/custom/", server.url()),
+            "bearer_access_token":"downstream-token"
+        })));
+    let config = Configuration::from_provider(sources).unwrap();
+    assert_eq!(
+        config
+            .extra_as::<Routing>("routing")
+            .unwrap()
+            .unwrap()
+            .queue,
+        "batch"
+    );
+    assert_eq!(
+        UsageClient::new(&config)
+            .task_usage("task-1")
+            .await
+            .unwrap()
+            .cpu_seconds,
+        Some(4.0)
+    );
+    request.assert_async().await;
+}
+
+#[test]
+fn json_store_supports_downstream_locked_updates() {
+    use ga4gh_sdk::utils::json_store::{JsonStore, JsonStoreIoError};
+
+    #[derive(Debug, PartialEq)]
+    struct RejectedChange;
+
+    impl std::fmt::Display for RejectedChange {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("application rejected the change")
+        }
+    }
+
+    impl std::error::Error for RejectedChange {}
+
+    fn rejected_change(items: &mut Vec<String>) -> Result<(), RejectedChange> {
+        items.push("rejected item".into());
+        Err(RejectedChange)
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = JsonStore::new(dir.path().join("state.json"), "application state");
+    let count = store
+        .update::<Vec<String>, _>(|items| {
+            items.push("new item".into());
+            Ok(items.len())
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(
+        store.read::<Vec<String>>().unwrap(),
+        Some(vec!["new item".into()])
+    );
+
+    let before = std::fs::read(store.path()).unwrap();
+    let error = store
+        .update::<Vec<String>, _>(|items| rejected_change(items).map_err(ga4gh_sdk::Error::other))
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<RejectedChange>(),
+        Some(&RejectedChange)
+    );
+    assert_eq!(std::fs::read(store.path()).unwrap(), before);
+
+    let invalid = JsonStore::new(dir.path().join("invalid\0.json"), "application state");
+    let error = invalid.read::<Vec<String>>().unwrap_err();
+    assert!(!error
+        .downcast_ref::<JsonStoreIoError>()
+        .unwrap()
+        .replacement_completed());
 }
